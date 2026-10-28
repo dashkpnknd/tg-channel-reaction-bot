@@ -258,7 +258,12 @@ class Service:
             self.store.set_meta("auto_prepare", "0")
             if self.store.meta("prepare_reported", "0") != "1":
                 self.store.set_meta("prepare_reported", "1")
-                await self.send_admin("Подключение завершено.\n" + self.status_text() + "\nПосмотреть ошибки: /excluded")
+                excluded = self.store.accounts("excluded")
+                message = "Подключение завершено.\n" + self.status_text()
+                if excluded:
+                    message += "\n\nНе удалось вступить в канал:\n" + "\n".join(
+                        f"• {x['title']}: {x['error']}" for x in excluded)
+                await self.send_admin(message)
             return
         row = pending[0]
         client = client_from_pyrogram(self.cfg, row["name"])
