@@ -256,14 +256,6 @@ class Service:
         pending = self.store.accounts("pending")
         if not pending:
             self.store.set_meta("auto_prepare", "0")
-            if self.store.meta("prepare_reported", "0") != "1":
-                self.store.set_meta("prepare_reported", "1")
-                excluded = self.store.accounts("excluded")
-                message = "Подключение завершено.\n" + self.status_text()
-                if excluded:
-                    message += "\n\nНе удалось вступить в канал:\n" + "\n".join(
-                        f"• {x['title']}: {x['error']}" for x in excluded)
-                await self.send_admin(message)
             return
         row = pending[0]
         client = client_from_pyrogram(self.cfg, row["name"])
@@ -295,8 +287,26 @@ class Service:
                     payload = await response.json()
                     if not payload.get("ok"):
                         log.warning("Admin notification failed: HTTP %s", response.status)
+                        return False
+                    return True
             except Exception as exc:
                 log.warning("Admin notification failed: %s", type(exc).__name__)
+                return False
+
+    async def maybe_report_completion(self):
+        if self.store.meta("prepare_reported") != "0" or self.store.accounts("pending"):
+            return
+        if time.time() < float(self.store.meta("next_report_at", "0")):
+            return
+        excluded = self.store.accounts("excluded")
+        message = "Подключение завершено.\n" + self.status_text()
+        if excluded:
+            message += "\n\nНе удалось вступить в канал:\n" + "\n".join(
+                f"• {x['title']}: {x['error']}" for x in excluded)
+        if await self.send_admin(message):
+            self.store.set_meta("prepare_reported", "1")
+        else:
+            self.store.set_meta("next_report_at", time.time() + 300)
 
     async def with_monitor(self, callback):
         joined = self.store.accounts("joined")
@@ -397,6 +407,7 @@ class Service:
             try:
                 self.store.sync_accounts(self.cfg)
                 await self.join_one_due()
+                await self.maybe_report_completion()
                 if self.store.meta("paused", "1") == "1":
                     await asyncio.sleep(5)
                     continue
