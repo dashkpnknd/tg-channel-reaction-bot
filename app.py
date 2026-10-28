@@ -36,6 +36,8 @@ class Config:
     poll_seconds: int
     delay_min: float
     delay_max: float
+    join_delay_min: float
+    join_delay_max: float
     default_reactions: tuple[str, ...]
 
     @classmethod
@@ -53,6 +55,8 @@ class Config:
             int(os.getenv("POLL_SECONDS", "30")),
             float(os.getenv("DELAY_MIN_SECONDS", "5")),
             float(os.getenv("DELAY_MAX_SECONDS", "15")),
+            float(os.getenv("JOIN_DELAY_MIN_SECONDS", "110")),
+            float(os.getenv("JOIN_DELAY_MAX_SECONDS", "130")),
             tuple(x.strip() for x in os.getenv("DEFAULT_REACTIONS", "👍,❤️,🔥,👏,🎉,😍").split(",") if x.strip()),
         )
 
@@ -136,6 +140,11 @@ class Store:
                         (error[:400], int(time.time()), name))
         self.db.commit()
 
+    def mark_cooldown(self, name, error):
+        self.db.execute("UPDATE accounts SET membership='cooldown',error=?,updated_at=? WHERE name=?",
+                        (error[:400], int(time.time()), name))
+        self.db.commit()
+
     def queue(self, post_id, manual=False):
         self.db.execute("""INSERT INTO posts(id,created_at,manual) VALUES(?,?,?)
             ON CONFLICT(id) DO UPDATE SET manual=max(posts.manual,excluded.manual)""",
@@ -147,9 +156,9 @@ class Store:
             SELECT 1 FROM accounts a LEFT JOIN deliveries d
               ON d.post_id=p.id AND d.account_name=a.name
             WHERE a.enabled=1 AND a.membership='joined'
-              AND (d.status IS NULL OR (d.status='error' AND d.updated_at<?)))
+              AND d.status IS NULL)
             AND (p.manual=1 OR p.id>?) ORDER BY p.id""",
-            (int(time.time()) - 900, int(self.meta("start_from", "0")))).fetchall()
+            (int(self.meta("start_from", "0")),)).fetchall()
 
     def delivered(self, post_id, name):
         row = self.db.execute("SELECT status FROM deliveries WHERE post_id=? AND account_name=?", (post_id, name)).fetchone()
@@ -238,46 +247,51 @@ class Service:
         self.cfg = cfg
         self.store = Store(cfg.state_db)
         self.store.sync_accounts(cfg)
-        self.prepare_task = None
 
-    async def join_pending(self, first_only=False):
+    async def join_one_due(self):
+        if self.store.meta("auto_prepare", "0") != "1":
+            return
+        if time.time() < float(self.store.meta("next_join_at", "0")):
+            return
         pending = self.store.accounts("pending")
-        for row in pending:
-            client = client_from_pyrogram(self.cfg, row["name"])
-            try:
-                await client.connect()
-                me = await client.get_me()
-                chat = await check_or_join(client, self.cfg.invite_hash, True)
-                if not isinstance(chat, types.Channel) or chat.access_hash is None:
-                    raise RuntimeError("joined entity has no channel access hash")
-                self.store.mark_member(row["name"], chat, bool(me and me.premium))
-                log.info("Joined %s (Premium: %s)", row["title"], bool(me and me.premium))
-                if first_only:
-                    return
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                self.store.mark_excluded(row["name"], error)
-                log.warning("Excluded %s: %s", row["title"], error)
-            finally:
-                await client.disconnect()
-            if not first_only:
-                await asyncio.sleep(random.uniform(1.5, 3.5))
-
-    async def prepare_and_report(self):
+        if not pending:
+            self.store.set_meta("auto_prepare", "0")
+            if self.store.meta("prepare_reported", "0") != "1":
+                self.store.set_meta("prepare_reported", "1")
+                await self.send_admin("Подключение завершено.\n" + self.status_text() + "\nПосмотреть ошибки: /excluded")
+            return
+        row = pending[0]
+        client = client_from_pyrogram(self.cfg, row["name"])
         try:
-            await self.join_pending()
-            message = "Подключение завершено.\n" + self.status_text()
-            excluded = self.store.accounts("excluded")
-            if excluded:
-                message += "\n\nНе удалось подключить:\n" + "\n".join(
-                    f"• {x['title']}: {x['error']}" for x in excluded)
-            async with aiohttp.ClientSession() as http:
-                await http.post(
+            await client.connect()
+            me = await client.get_me()
+            chat = await check_or_join(client, self.cfg.invite_hash, True)
+            if not isinstance(chat, types.Channel) or chat.access_hash is None:
+                raise RuntimeError("joined entity has no channel access hash")
+            self.store.mark_member(row["name"], chat, bool(me and me.premium))
+            log.info("Joined %s (Premium: %s)", row["title"], bool(me and me.premium))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.mark_excluded(row["name"], error)
+            log.warning("Excluded %s: %s", row["title"], error)
+        finally:
+            await client.disconnect()
+            delay = random.uniform(self.cfg.join_delay_min, self.cfg.join_delay_max)
+            self.store.set_meta("next_join_at", time.time() + delay)
+
+    async def send_admin(self, message):
+        async with aiohttp.ClientSession() as http:
+            try:
+                async with http.post(
                     f"https://api.telegram.org/bot{self.cfg.bot_token}/sendMessage",
                     json={"chat_id": self.cfg.admin_id, "text": message[:3900]},
-                )
-        except Exception:
-            log.exception("Account preparation failed")
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    payload = await response.json()
+                    if not payload.get("ok"):
+                        log.warning("Admin notification failed: HTTP %s", response.status)
+            except Exception as exc:
+                log.warning("Admin notification failed: %s", type(exc).__name__)
 
     async def with_monitor(self, callback):
         joined = self.store.accounts("joined")
@@ -356,15 +370,15 @@ class Service:
                 selected = choose_reactions(options, msg, max_unique, target_count)
                 existing = [x.reaction for x in msg.reactions.results if x.chosen_order is not None] if msg.reactions else []
                 if len(existing) < target_count:
-                    try:
-                        await client(functions.messages.SendReactionRequest(peer=peer, msg_id=post_id, reaction=selected))
-                    except FloodWaitError as exc:
-                        log.warning("Flood wait for %s: %ss", row["title"], exc.seconds)
-                        await asyncio.sleep(exc.seconds + 1)
-                        await client(functions.messages.SendReactionRequest(peer=peer, msg_id=post_id, reaction=selected))
+                    await client(functions.messages.SendReactionRequest(peer=peer, msg_id=post_id, reaction=selected))
                 result = ",".join(str(reaction_key(x)[1]) for x in selected)
                 self.store.delivery(post_id, row["name"], "done", result)
                 log.info("Reacted %s post %s: %s", row["title"], post_id, result)
+            except FloodWaitError as exc:
+                error = f"FloodWaitError: wait {exc.seconds}s"
+                self.store.delivery(post_id, row["name"], "error", error=error)
+                self.store.mark_cooldown(row["name"], error)
+                log.warning("Paused account %s after Telegram wait of %ss", row["title"], exc.seconds)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 self.store.delivery(post_id, row["name"], "error", error=error)
@@ -376,10 +390,24 @@ class Service:
     async def worker(self):
         while True:
             try:
+                self.store.sync_accounts(self.cfg)
+                await self.join_one_due()
                 if self.store.meta("paused", "1") == "1":
                     await asyncio.sleep(5)
                     continue
-                self.store.sync_accounts(self.cfg)
+                if self.store.meta("initial_post", "0") == "1":
+                    async def latest(client, peer):
+                        messages = await client.get_messages(peer, limit=1)
+                        return next((m for m in messages if isinstance(m, types.Message)), None)
+                    post = await self.with_monitor(latest)
+                    if post is None:
+                        await asyncio.sleep(self.cfg.poll_seconds)
+                        continue
+                    self.store.set_meta("last_seen", post.id)
+                    self.store.set_meta("start_from", post.id)
+                    self.store.queue(post.id, manual=True)
+                    self.store.set_meta("initial_post", "0")
+                    log.info("Pilot post queued: %s", post.id)
                 await self.scan_posts()
                 for row in self.store.pending_posts():
                     if self.store.meta("paused", "1") == "1":
@@ -392,8 +420,11 @@ class Service:
     def status_text(self):
         s = self.store.summary()
         return (f"Канал: подключено {s.get('joined', 0)}, исключено {s.get('excluded', 0)}, "
-                f"ожидает {s.get('pending', 0)}.\nПостов: {s['posts']}. Успешных действий: {s['done']}. "
-                f"Ошибок реакций: {s['errors']}.\nРежим: {'пауза' if self.store.meta('paused','1')=='1' else 'работает'}.")
+                f"ожидает {s.get('pending', 0)}, остановлено Telegram {s.get('cooldown', 0)}.\n"
+                f"Постов: {s['posts']}. Успешных действий: {s['done']}. "
+                f"Ошибок реакций: {s['errors']}.\n"
+                f"Режим: {'пауза' if self.store.meta('paused','1')=='1' else 'работает'}; "
+                f"подключение: {'идёт' if self.store.meta('auto_prepare','0')=='1' else 'завершено'}.")
 
     async def bot(self):
         base = f"https://api.telegram.org/bot{self.cfg.bot_token}"
@@ -416,7 +447,7 @@ class Service:
                         command = message.get("text", "").split()[0].split("@")[0]
                         reply = None
                         if command in ("/start", "/status"):
-                            reply = self.status_text() + "\n\nКоманды: /status /accounts /excluded /prepare /pause /resume /last5"
+                            reply = self.status_text() + "\n\nКоманды: /status /accounts /excluded /prepare /launch /pause /resume /last5"
                         elif command == "/accounts":
                             rows = self.store.accounts()
                             reply = "Аккаунты:\n" + "\n".join(f"• {html.escape(x['title'])}: {x['membership']}, {'Premium' if x['premium'] else 'обычный' if x['premium']==0 else 'не проверен'}" for x in rows)
@@ -425,27 +456,37 @@ class Service:
                             reply = "Не удалось подключить:\n" + ("\n".join(f"• {html.escape(x['title'])}: {html.escape(x['error'] or '')}" for x in rows) if rows else "нет")
                         elif command == "/pause":
                             self.store.set_meta("paused", "1")
-                            reply = "Поставлено на паузу."
+                            self.store.set_meta("auto_prepare", "0")
+                            reply = "Реакции и подключение аккаунтов поставлены на паузу."
                         elif command == "/prepare":
-                            if self.store.meta("paused", "1") != "1":
-                                reply = "Сначала поставьте на паузу командой /pause."
-                            elif self.prepare_task and not self.prepare_task.done():
+                            if self.store.meta("auto_prepare", "0") == "1":
                                 reply = "Подключение уже идёт. Текущий результат: /status."
                             else:
-                                self.prepare_task = asyncio.create_task(self.prepare_and_report())
-                                reply = "Подключение аккаунтов запущено. Реакции не ставятся; смотрите /status и /excluded."
+                                self.store.set_meta("auto_prepare", "1")
+                                self.store.set_meta("next_join_at", "0")
+                                self.store.set_meta("prepare_reported", "0")
+                                reply = "Подключение аккаунтов запущено с интервалом около двух минут. Реакции пока не ставятся."
+                        elif command == "/launch":
+                            if self.store.meta("paused", "1") == "0":
+                                reply = "Сервис уже работает. Текущий результат: /status."
+                            else:
+                                if self.store.meta("auto_prepare", "0") != "1":
+                                    self.store.set_meta("next_join_at", "0")
+                                self.store.set_meta("auto_prepare", "1")
+                                self.store.set_meta("prepare_reported", "0")
+                                self.store.set_meta("initial_post", "1")
+                                self.store.set_meta("paused", "0")
+                                reply = "Запущено: аккаунты будут подключаться по очереди. Сервис начнёт с текущего последнего поста и продолжит с новыми."
                         elif command == "/resume":
-                            if self.prepare_task and not self.prepare_task.done():
-                                reply = "Подключение аккаунтов ещё идёт. Дождитесь завершения /prepare."
-                            elif self.store.accounts("pending"):
-                                reply = "Есть неподключённые аккаунты. Сначала выполните /prepare."
-                            elif not self.store.accounts("joined"):
+                            if not self.store.accounts("joined"):
                                 reply = "Нет доступных аккаунтов в канале. Проверьте /excluded."
                             else:
                                 baseline_id = await self.baseline()
                                 if baseline_id is None:
                                     reply = "Не удалось прочитать канал; работа осталась на паузе."
                                 else:
+                                    if self.store.accounts("pending"):
+                                        self.store.set_meta("auto_prepare", "1")
                                     self.store.set_meta("paused", "0")
                                     reply = f"Работа включена. Посты до #{baseline_id} автоматически не обрабатываются."
                         elif command == "/last5":
@@ -483,8 +524,12 @@ async def main():
                 print("First account is not a member; invitation is valid.")
         finally:
             await client.disconnect()
-    elif cmd == "join-first":
-        await service.join_pending(first_only=True)
+    elif cmd == "launch":
+        service.store.set_meta("auto_prepare", "1")
+        service.store.set_meta("next_join_at", "0")
+        service.store.set_meta("prepare_reported", "0")
+        service.store.set_meta("initial_post", "1")
+        service.store.set_meta("paused", "0")
         print(service.status_text())
     elif cmd == "run":
         await asyncio.gather(service.worker(), service.bot())

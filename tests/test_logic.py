@@ -38,6 +38,20 @@ class StoreTests(unittest.TestCase):
             store = Store(Path(folder) / "state.sqlite3")
             self.assertEqual(store.meta("paused", "1"), "1")
 
+    def test_pilot_and_future_posts_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "state.sqlite3")
+            store.db.execute("""INSERT INTO accounts(name,title,user_id,membership,updated_at)
+                VALUES('a','A',1,'joined',0)""")
+            store.db.commit()
+            store.set_meta("start_from", "100")
+            store.queue(99)
+            store.queue(100, manual=True)
+            store.queue(101)
+            self.assertEqual([x["id"] for x in store.pending_posts()], [100, 101])
+            store.delivery(100, "a", "error", error="Telegram rejected reaction")
+            self.assertEqual([x["id"] for x in store.pending_posts()], [101])
+
 
 if __name__ == "__main__":
     unittest.main()
