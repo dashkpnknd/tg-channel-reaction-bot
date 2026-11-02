@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from telethon import types
 
-from app import Store, choose_reactions, reaction_key, reaction_quota
+from app import Store, choose_reactions, distinct_posts, reaction_key, reaction_quota
 
 
 class ReactionChoiceTests(unittest.TestCase):
@@ -35,6 +35,14 @@ class ReactionChoiceTests(unittest.TestCase):
         self.assertEqual(reaction_quota(True, 5, 2), 2)
         self.assertEqual(reaction_quota(True, 5, 1), 1)
         self.assertEqual(reaction_quota(False, 5, 2), 1)
+
+    def test_media_album_counts_as_one_post_with_caption(self):
+        messages = [SimpleNamespace(id=72, grouped_id=None, message="new"),
+                    SimpleNamespace(id=70, grouped_id=99, message=""),
+                    SimpleNamespace(id=69, grouped_id=99, message=""),
+                    SimpleNamespace(id=62, grouped_id=99, message="caption"),
+                    SimpleNamespace(id=61, grouped_id=None, message="")]
+        self.assertEqual([m.id for m in distinct_posts(messages)], [72, 62, 61])
 
 
 class StoreTests(unittest.TestCase):

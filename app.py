@@ -205,8 +205,10 @@ class Store:
     def summary(self):
         result = {r[0]: r[1] for r in self.db.execute("SELECT membership,count(*) FROM accounts WHERE enabled=1 GROUP BY membership")}
         result["posts"] = self.db.execute("SELECT count(*) FROM posts").fetchone()[0]
-        result["done"] = self.db.execute("SELECT count(*) FROM deliveries WHERE status='done'").fetchone()[0]
-        result["errors"] = self.db.execute("SELECT count(*) FROM deliveries WHERE status='error'").fetchone()[0]
+        result["done"] = self.db.execute("""SELECT count(*) FROM deliveries d
+            JOIN posts p ON p.id=d.post_id WHERE d.status='done'""").fetchone()[0]
+        result["errors"] = self.db.execute("""SELECT count(*) FROM deliveries d
+            JOIN posts p ON p.id=d.post_id WHERE d.status='error'""").fetchone()[0]
         return result
 
 
@@ -262,6 +264,16 @@ def choose_reactions(options, message, max_unique, target_count):
 def reaction_quota(premium, available_count, remaining=None):
     quota = min(3 if premium else 1, available_count)
     return min(quota, remaining) if remaining is not None else quota
+
+
+def distinct_posts(messages):
+    """Treat every Telegram media album as one channel post."""
+    groups = {}
+    for message in messages:
+        key = ("album", message.grouped_id) if message.grouped_id else ("message", message.id)
+        groups.setdefault(key, []).append(message)
+    return [next((m for m in group if m.message), min(group, key=lambda m: m.id))
+            for group in groups.values()]
 
 
 async def check_or_join(client, invite_hash, do_join):
@@ -376,25 +388,35 @@ class Service:
 
     async def scan_posts(self, recent_count=0):
         async def scan(client, peer):
+            messages = []
             if recent_count or self.store.meta("last_seen") is None:
-                messages = await client.get_messages(peer, limit=recent_count or 5)
-                posts = [m for m in messages if isinstance(m, types.Message)]
+                count = recent_count or 5
+                seen = set()
+                async for m in client.iter_messages(peer):
+                    if not isinstance(m, types.Message):
+                        continue
+                    key = ("album", m.grouped_id) if m.grouped_id else ("message", m.id)
+                    if key not in seen and len(seen) >= count:
+                        break
+                    seen.add(key)
+                    messages.append(m)
+                posts = distinct_posts(messages)
                 for m in posts:
                     self.store.queue(m.id, manual=bool(recent_count))
-                if posts:
-                    latest = max(m.id for m in posts)
+                if messages:
+                    latest = max(m.id for m in messages)
                     current = int(self.store.meta("last_seen", "0"))
                     self.store.set_meta("last_seen", max(latest, current))
                 return len(posts)
             cursor = int(self.store.meta("last_seen", "0"))
-            posts = []
             async for m in client.iter_messages(peer, min_id=cursor, reverse=True):
                 if isinstance(m, types.Message):
-                    posts.append(m)
+                    messages.append(m)
+            posts = distinct_posts(messages)
             for m in posts:
                 self.store.queue(m.id)
-            if posts:
-                self.store.set_meta("last_seen", max(m.id for m in posts))
+            if messages:
+                self.store.set_meta("last_seen", max(m.id for m in messages))
             return len(posts)
         return await self.with_monitor(scan)
 
@@ -414,14 +436,8 @@ class Service:
         for row in accounts:
             if self.store.meta("paused", "1") == "1":
                 return
-            remaining = target - self.store.reaction_count(post_id) if target is not None else None
-            if remaining is not None and remaining <= 0:
-                self.store.complete_post(post_id)
-                break
             if self.store.delivered(post_id, row["name"]):
                 continue
-            if target is not None:
-                self.rotation_store.advance_account(row["name"])
             client = client_from_pyrogram(self.cfg, row["name"])
             try:
                 await client.connect()
@@ -430,12 +446,18 @@ class Service:
                 if not isinstance(msg, types.Message):
                     self.store.delivery(post_id, row["name"], "skipped", error="post unavailable")
                     continue
+                visible = sum(x.count for x in msg.reactions.results) if msg.reactions else 0
+                remaining = target - visible if target is not None else None
+                if remaining is not None and remaining <= 0:
+                    self.store.complete_post(post_id)
+                    log.info("Post %s already has %s reactions; target %s", post_id, visible, target)
+                    return
+                if target is not None:
+                    self.rotation_store.advance_account(row["name"])
                 me = await client.get_me()
-                target_count = reaction_quota(bool(me and me.premium), len(options), remaining)
                 existing = [x.reaction for x in msg.reactions.results if x.chosen_order is not None] if msg.reactions else []
-                if remaining is not None and len(existing) > remaining:
-                    self.store.delivery(post_id, row["name"], "skipped", error="existing reactions exceed remaining budget")
-                    continue
+                target_count = reaction_quota(bool(me and me.premium), len(options),
+                                              remaining + len(existing) if remaining is not None else None)
                 target_count = max(target_count, len(existing))
                 selected = choose_reactions(options, msg, max_unique, target_count)
                 if len(existing) < target_count:
@@ -443,6 +465,10 @@ class Service:
                 result = ",".join(str(reaction_key(x)[1]) for x in selected)
                 self.store.delivery(post_id, row["name"], "done", result)
                 log.info("Reacted %s post %s: %s", row["title"], post_id, result)
+                if target is not None and visible + len(selected) - len(existing) >= target:
+                    self.store.complete_post(post_id)
+                    log.info("Post %s reached reaction target %s", post_id, target)
+                    return
             except FloodWaitError as exc:
                 error = f"FloodWaitError: wait {exc.seconds}s"
                 self.store.delivery(post_id, row["name"], "error", error=error)
@@ -455,9 +481,6 @@ class Service:
             finally:
                 await client.disconnect()
             await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
-        if target is not None and self.store.reaction_count(post_id) >= target:
-            self.store.complete_post(post_id)
-            log.info("Post %s reached reaction target %s", post_id, target)
 
     async def work_once(self):
         self.store.sync_accounts(self.cfg)
