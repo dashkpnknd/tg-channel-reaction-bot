@@ -481,6 +481,8 @@ class Service:
             finally:
                 await client.disconnect()
             await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
+            if target is not None:
+                return
 
     async def work_once(self):
         self.store.sync_accounts(self.cfg)
