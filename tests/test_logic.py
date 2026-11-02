@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from telethon import types
 
-from app import Store, choose_reactions, reaction_key
+from app import Store, choose_reactions, reaction_key, reaction_quota
 
 
 class ReactionChoiceTests(unittest.TestCase):
@@ -31,6 +31,11 @@ class ReactionChoiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             choose_reactions(self.options, self.message((0, False)), 1, 3)
 
+    def test_last_account_uses_only_remaining_reactions(self):
+        self.assertEqual(reaction_quota(True, 5, 2), 2)
+        self.assertEqual(reaction_quota(True, 5, 1), 1)
+        self.assertEqual(reaction_quota(False, 5, 2), 1)
+
 
 class StoreTests(unittest.TestCase):
     def test_new_store_starts_paused(self):
@@ -51,6 +56,45 @@ class StoreTests(unittest.TestCase):
             self.assertEqual([x["id"] for x in store.pending_posts()], [100, 101])
             store.delivery(100, "a", "error", error="Telegram rejected reaction")
             self.assertEqual([x["id"] for x in store.pending_posts()], [101])
+
+    def test_new_posts_have_budget_and_rotate_accounts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "state.sqlite3")
+            store.db.executemany("""INSERT INTO accounts(name,title,user_id,membership,updated_at)
+                VALUES(?,?,?,'joined',0)""", [(x, x, i) for i, x in enumerate("abc", 1)])
+            store.db.commit()
+            store.queue(201)
+            target = store.post(201)["reaction_target"]
+            self.assertIn(target, range(15, 19))
+            self.assertEqual([r["name"] for r in store.rotated_accounts()], list("abc"))
+            store.advance_account("b")
+            self.assertEqual([r["name"] for r in store.rotated_accounts()], list("cab"))
+            other = Store(Path(folder) / "other.sqlite3")
+            other.db.executemany("""INSERT INTO accounts(name,title,user_id,membership,updated_at)
+                VALUES(?,?,?,'joined',0)""", [(x, x, i) for i, x in enumerate("abc", 1)])
+            other.db.commit()
+            self.assertEqual([r["name"] for r in other.rotated_accounts(store.meta("last_used_account"))], list("cab"))
+            store.delivery(201, "a", "done", "👍,🔥,❤️")
+            store.delivery(201, "b", "done", "👍")
+            self.assertEqual(store.reaction_count(201), 4)
+            store.complete_post(201)
+            self.assertEqual(store.pending_posts(), [])
+
+    def test_migration_preserves_existing_posts_without_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.sqlite3"
+            import sqlite3
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE posts(id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, manual INTEGER NOT NULL DEFAULT 0)")
+            db.execute("INSERT INTO posts VALUES(180,1,1)")
+            db.commit()
+            db.close()
+            store = Store(path)
+            self.assertIsNone(store.post(180)["reaction_target"])
+            store.queue(180, manual=True)
+            self.assertIsNone(store.post(180)["reaction_target"])
+            store.queue(181)
+            self.assertIn(store.post(181)["reaction_target"], range(15, 19))
 
 
 if __name__ == "__main__":

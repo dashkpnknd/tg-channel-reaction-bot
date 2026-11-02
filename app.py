@@ -6,7 +6,7 @@ import random
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import aiohttp
@@ -72,7 +72,10 @@ class Store:
                 enabled INTEGER NOT NULL DEFAULT 1, membership TEXT NOT NULL DEFAULT 'pending',
                 channel_id INTEGER, access_hash INTEGER, premium INTEGER,
                 error TEXT, updated_at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, manual INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS posts(
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                manual INTEGER NOT NULL DEFAULT 0,
+                reaction_target INTEGER, completed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS deliveries(
                 post_id INTEGER NOT NULL, account_name TEXT NOT NULL, status TEXT NOT NULL,
                 reactions TEXT, error TEXT, updated_at INTEGER NOT NULL,
@@ -85,6 +88,10 @@ class Store:
         post_columns = {row[1] for row in self.db.execute("PRAGMA table_info(posts)")}
         if "manual" not in post_columns:
             self.db.execute("ALTER TABLE posts ADD COLUMN manual INTEGER NOT NULL DEFAULT 0")
+        if "reaction_target" not in post_columns:
+            self.db.execute("ALTER TABLE posts ADD COLUMN reaction_target INTEGER")
+        if "completed" not in post_columns:
+            self.db.execute("ALTER TABLE posts ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def meta(self, key, default=None):
@@ -146,13 +153,37 @@ class Store:
         self.db.commit()
 
     def queue(self, post_id, manual=False):
-        self.db.execute("""INSERT INTO posts(id,created_at,manual) VALUES(?,?,?)
+        self.db.execute("""INSERT INTO posts(id,created_at,manual,reaction_target) VALUES(?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET manual=max(posts.manual,excluded.manual)""",
-            (post_id, int(time.time()), int(manual)))
+            (post_id, int(time.time()), int(manual), random.randint(15, 18)))
         self.db.commit()
 
+    def post(self, post_id):
+        return self.db.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+
+    def reaction_count(self, post_id):
+        rows = self.db.execute(
+            "SELECT reactions FROM deliveries WHERE post_id=? AND status='done'", (post_id,))
+        return sum(len(row[0].split(",")) for row in rows if row[0])
+
+    def complete_post(self, post_id):
+        self.db.execute("UPDATE posts SET completed=1 WHERE id=? AND reaction_target IS NOT NULL", (post_id,))
+        self.db.commit()
+
+    def rotated_accounts(self, last_name=None):
+        joined = self.accounts("joined")
+        if not joined:
+            return []
+        if last_name is None:
+            last_name = self.meta("last_used_account", "")
+        start = next((i for i, row in enumerate(joined) if row["name"] > last_name), 0)
+        return joined[start:] + joined[:start]
+
+    def advance_account(self, name):
+        self.set_meta("last_used_account", name)
+
     def pending_posts(self):
-        return self.db.execute("""SELECT p.id FROM posts p WHERE EXISTS(
+        return self.db.execute("""SELECT p.id FROM posts p WHERE p.completed=0 AND EXISTS(
             SELECT 1 FROM accounts a LEFT JOIN deliveries d
               ON d.post_id=p.id AND d.account_name=a.name
             WHERE a.enabled=1 AND a.membership='joined'
@@ -162,7 +193,7 @@ class Store:
 
     def delivered(self, post_id, name):
         row = self.db.execute("SELECT status FROM deliveries WHERE post_id=? AND account_name=?", (post_id, name)).fetchone()
-        return row is not None and row[0] == "done"
+        return row is not None
 
     def delivery(self, post_id, name, status, reactions="", error=""):
         self.db.execute("""INSERT INTO deliveries VALUES(?,?,?,?,?,?)
@@ -228,6 +259,11 @@ def choose_reactions(options, message, max_unique, target_count):
     return existing + random.sample(pool, needed)
 
 
+def reaction_quota(premium, available_count, remaining=None):
+    quota = min(3 if premium else 1, available_count)
+    return min(quota, remaining) if remaining is not None else quota
+
+
 async def check_or_join(client, invite_hash, do_join):
     invitation = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
     if isinstance(invitation, types.ChatInviteAlready):
@@ -243,10 +279,14 @@ async def check_or_join(client, invite_hash, do_join):
 
 
 class Service:
-    def __init__(self, cfg):
+    def __init__(self, cfg, label="Основной канал", rotation_store=None, defer_until_prepared=False):
         self.cfg = cfg
+        self.label = label
+        self.defer_until_prepared = defer_until_prepared
         self.store = Store(cfg.state_db)
         self.store.sync_accounts(cfg)
+        self.rotation_store = rotation_store or self.store
+        self.other = None
 
     async def join_one_due(self):
         if self.store.meta("auto_prepare", "0") != "1":
@@ -299,7 +339,7 @@ class Service:
         if time.time() < float(self.store.meta("next_report_at", "0")):
             return
         excluded = self.store.accounts("excluded")
-        message = "Подключение завершено.\n" + self.status_text()
+        message = f"Подключение завершено ({self.label}).\n" + self.status_text()
         if excluded:
             message += "\n\nНе удалось вступить в канал:\n" + "\n".join(
                 f"• {x['title']}: {x['error']}" for x in excluded)
@@ -334,13 +374,13 @@ class Service:
             self.store.set_meta("start_from", post_id)
         return post_id
 
-    async def scan_posts(self, last_five=False):
+    async def scan_posts(self, recent_count=0):
         async def scan(client, peer):
-            if last_five or self.store.meta("last_seen") is None:
-                messages = await client.get_messages(peer, limit=5)
+            if recent_count or self.store.meta("last_seen") is None:
+                messages = await client.get_messages(peer, limit=recent_count or 5)
                 posts = [m for m in messages if isinstance(m, types.Message)]
                 for m in posts:
-                    self.store.queue(m.id, manual=last_five)
+                    self.store.queue(m.id, manual=bool(recent_count))
                 if posts:
                     latest = max(m.id for m in posts)
                     current = int(self.store.meta("last_seen", "0"))
@@ -359,6 +399,8 @@ class Service:
         return await self.with_monitor(scan)
 
     async def process_post(self, post_id):
+        post = self.store.post(post_id)
+        target = post["reaction_target"] if post else None
         async def get_allowed(client, peer):
             full = await client(functions.channels.GetFullChannelRequest(channel=peer))
             return allowed_reactions(full, self.cfg.default_reactions), getattr(full.full_chat, "reactions_limit", None)
@@ -367,23 +409,35 @@ class Service:
         if not options:
             log.warning("Post %s: no available reactions", post_id)
             return
-        for row in self.store.accounts("joined"):
+        accounts = (self.store.rotated_accounts(self.rotation_store.meta("last_used_account", ""))
+                    if target is not None else self.store.accounts("joined"))
+        for row in accounts:
             if self.store.meta("paused", "1") == "1":
                 return
+            remaining = target - self.store.reaction_count(post_id) if target is not None else None
+            if remaining is not None and remaining <= 0:
+                self.store.complete_post(post_id)
+                break
             if self.store.delivered(post_id, row["name"]):
                 continue
+            if target is not None:
+                self.rotation_store.advance_account(row["name"])
             client = client_from_pyrogram(self.cfg, row["name"])
             try:
                 await client.connect()
                 peer = types.InputPeerChannel(row["channel_id"], row["access_hash"])
                 msg = await client.get_messages(peer, ids=post_id)
                 if not isinstance(msg, types.Message):
-                    self.store.delivery(post_id, row["name"], "done", error="post unavailable")
+                    self.store.delivery(post_id, row["name"], "skipped", error="post unavailable")
                     continue
                 me = await client.get_me()
-                target_count = min(3 if me and me.premium else 1, len(options))
-                selected = choose_reactions(options, msg, max_unique, target_count)
+                target_count = reaction_quota(bool(me and me.premium), len(options), remaining)
                 existing = [x.reaction for x in msg.reactions.results if x.chosen_order is not None] if msg.reactions else []
+                if remaining is not None and len(existing) > remaining:
+                    self.store.delivery(post_id, row["name"], "skipped", error="existing reactions exceed remaining budget")
+                    continue
+                target_count = max(target_count, len(existing))
+                selected = choose_reactions(options, msg, max_unique, target_count)
                 if len(existing) < target_count:
                     await client(functions.messages.SendReactionRequest(peer=peer, msg_id=post_id, reaction=selected))
                 result = ",".join(str(reaction_key(x)[1]) for x in selected)
@@ -401,46 +455,58 @@ class Service:
             finally:
                 await client.disconnect()
             await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
+        if target is not None and self.store.reaction_count(post_id) >= target:
+            self.store.complete_post(post_id)
+            log.info("Post %s reached reaction target %s", post_id, target)
+
+    async def work_once(self):
+        self.store.sync_accounts(self.cfg)
+        await self.join_one_due()
+        await self.maybe_report_completion()
+        if self.store.meta("paused", "1") == "1":
+            return
+        if self.store.meta("backfill_eight", "0") == "1" and self.store.accounts("joined"):
+            count = await self.scan_posts(recent_count=8)
+            if count is not None:
+                self.store.set_meta("backfill_eight", "0")
+                log.info("Queued %s recent posts for %s", count, self.label)
+        if self.defer_until_prepared and (self.store.accounts("pending") or self.store.meta("backfill_eight", "0") == "1"):
+            return
+        if self.store.meta("initial_post", "0") == "1":
+            async def latest(client, peer):
+                messages = await client.get_messages(peer, limit=1)
+                return next((m for m in messages if isinstance(m, types.Message)), None)
+            post = await self.with_monitor(latest)
+            if post is None:
+                return
+            self.store.set_meta("last_seen", post.id)
+            self.store.set_meta("start_from", post.id)
+            self.store.queue(post.id, manual=True)
+            self.store.set_meta("initial_post", "0")
+            log.info("Pilot post queued: %s", post.id)
+        await self.scan_posts()
+        for row in self.store.pending_posts():
+            if self.store.meta("paused", "1") == "1":
+                break
+            await self.process_post(row["id"])
 
     async def worker(self):
         while True:
             try:
-                self.store.sync_accounts(self.cfg)
-                await self.join_one_due()
-                await self.maybe_report_completion()
-                if self.store.meta("paused", "1") == "1":
-                    await asyncio.sleep(5)
-                    continue
-                if self.store.meta("initial_post", "0") == "1":
-                    async def latest(client, peer):
-                        messages = await client.get_messages(peer, limit=1)
-                        return next((m for m in messages if isinstance(m, types.Message)), None)
-                    post = await self.with_monitor(latest)
-                    if post is None:
-                        await asyncio.sleep(self.cfg.poll_seconds)
-                        continue
-                    self.store.set_meta("last_seen", post.id)
-                    self.store.set_meta("start_from", post.id)
-                    self.store.queue(post.id, manual=True)
-                    self.store.set_meta("initial_post", "0")
-                    log.info("Pilot post queued: %s", post.id)
-                await self.scan_posts()
-                for row in self.store.pending_posts():
-                    if self.store.meta("paused", "1") == "1":
-                        break
-                    await self.process_post(row["id"])
+                await self.work_once()
             except Exception:
-                log.exception("Worker iteration failed")
+                log.exception("Worker iteration failed for %s", self.label)
             await asyncio.sleep(self.cfg.poll_seconds)
 
     def status_text(self):
         s = self.store.summary()
-        return (f"Канал: подключено {s.get('joined', 0)}, исключено {s.get('excluded', 0)}, "
+        own = (f"{self.label}: подключено {s.get('joined', 0)}, исключено {s.get('excluded', 0)}, "
                 f"ожидает {s.get('pending', 0)}, остановлено Telegram {s.get('cooldown', 0)}.\n"
                 f"Постов: {s['posts']}. Успешных действий: {s['done']}. "
                 f"Ошибок реакций: {s['errors']}.\n"
                 f"Режим: {'пауза' if self.store.meta('paused','1')=='1' else 'работает'}; "
                 f"подключение: {'идёт' if self.store.meta('auto_prepare','0')=='1' else 'завершено'}.")
+        return own + ("\n\n" + self.other.status_text() if self.other else "")
 
     async def bot(self):
         base = f"https://api.telegram.org/bot{self.cfg.bot_token}"
@@ -468,11 +534,15 @@ class Service:
                             rows = self.store.accounts()
                             reply = "Аккаунты:\n" + "\n".join(f"• {html.escape(x['title'])}: {x['membership']}, {'Premium' if x['premium'] else 'обычный' if x['premium']==0 else 'не проверен'}" for x in rows)
                         elif command == "/excluded":
-                            rows = self.store.accounts("excluded")
-                            reply = "Не удалось подключить:\n" + ("\n".join(f"• {html.escape(x['title'])}: {html.escape(x['error'] or '')}" for x in rows) if rows else "нет")
+                            services = [self] + ([self.other] if self.other else [])
+                            lines = [f"{s.label}:\n" + ("\n".join(
+                                f"• {html.escape(x['title'])}: {html.escape(x['error'] or '')}"
+                                for x in s.store.accounts("excluded")) or "нет") for s in services]
+                            reply = "Не удалось подключить:\n" + "\n\n".join(lines)
                         elif command == "/pause":
-                            self.store.set_meta("paused", "1")
-                            self.store.set_meta("auto_prepare", "0")
+                            for service in [self] + ([self.other] if self.other else []):
+                                service.store.set_meta("paused", "1")
+                                service.store.set_meta("auto_prepare", "0")
                             reply = "Реакции и подключение аккаунтов поставлены на паузу."
                         elif command == "/prepare":
                             if self.store.meta("auto_prepare", "0") == "1":
@@ -504,12 +574,16 @@ class Service:
                                     if self.store.accounts("pending"):
                                         self.store.set_meta("auto_prepare", "1")
                                     self.store.set_meta("paused", "0")
-                                    reply = f"Работа включена. Посты до #{baseline_id} автоматически не обрабатываются."
+                                    if self.other:
+                                        if self.other.store.accounts("pending"):
+                                            self.other.store.set_meta("auto_prepare", "1")
+                                        self.other.store.set_meta("paused", "0")
+                                    reply = f"Работа включена. Посты до #{baseline_id} в основном канале автоматически не обрабатываются."
                         elif command == "/last5":
                             if self.store.meta("paused", "1") == "1":
                                 reply = "Сначала запустите работу командой /resume."
                             else:
-                                count = await self.scan_posts(last_five=True)
+                                count = await self.scan_posts(recent_count=5)
                                 reply = f"В очередь добавлены последние пять постов: {count or 0}. Уже обработанные аккаунты не повторяются."
                         if reply:
                             async with http.post(f"{base}/sendMessage", json={"chat_id": message["chat"]["id"], "text": reply[:3900], "parse_mode": "HTML"}) as resp:
@@ -519,9 +593,34 @@ class Service:
                     await asyncio.sleep(5)
 
 
+async def work_all(services, poll_seconds):
+    while True:
+        for service in services:
+            try:
+                await service.work_once()
+            except Exception:
+                log.exception("Worker iteration failed for %s", service.label)
+        await asyncio.sleep(poll_seconds)
+
+
 async def main():
     cfg = Config.from_env()
     service = Service(cfg)
+    services = [service]
+    second_hash = os.getenv("SECOND_INVITE_HASH")
+    if second_hash:
+        second_path = Path(os.getenv("SECOND_STATE_DB") or cfg.state_db.with_name("state_second.sqlite3"))
+        second_cfg = replace(cfg, invite_hash=second_hash, state_db=second_path)
+        second = Service(second_cfg, label="Второй канал", rotation_store=service.store,
+                         defer_until_prepared=True)
+        service.other = second
+        services.append(second)
+        if second.store.meta("configured") != "1":
+            second.store.set_meta("auto_prepare", "1")
+            second.store.set_meta("prepare_reported", "0")
+            second.store.set_meta("backfill_eight", "1")
+            second.store.set_meta("paused", "0")
+            second.store.set_meta("configured", "1")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "inspect":
         print("Dialog Hub accounts:", len(service.store.accounts()))
@@ -548,7 +647,7 @@ async def main():
         service.store.set_meta("paused", "0")
         print(service.status_text())
     elif cmd == "run":
-        await asyncio.gather(service.worker(), service.bot())
+        await asyncio.gather(work_all(services, cfg.poll_seconds), service.bot())
     else:
         raise SystemExit(f"Unknown command: {cmd}")
 
